@@ -1,11 +1,13 @@
+import json
 import os
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
 HEADERS = {
-    "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/shivii-mallya/Polite_Scraper.git)"
+    "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/shivii-mallya/Polite_Scraper)"
 }
 CACHE_DIR = "cache"
 
@@ -16,11 +18,8 @@ def fetch_page(url: str, cache_filename: str) -> str:
 
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        print(f"CACHE HIT | {cache_filename} | Size: {len(content)} bytes")
-        return content
+            return f.read()
 
-    # Polite delay before network request
     time.sleep(0.5)
     response = requests.get(url, headers=HEADERS, timeout=5)
     
@@ -31,21 +30,17 @@ def fetch_page(url: str, cache_filename: str) -> str:
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"FETCH | {cache_filename} | Status: {response.status_code} | Size: {len(content)} bytes")
     return content
 
 def extract_book_urls(html: str, current_page_url: str) -> list[str]:
-    """Extract all book links from a single catalogue page and convert to absolute URLs."""
+    """Extract all book links from a single catalogue page."""
     soup = BeautifulSoup(html, "html.parser")
     book_urls = []
     
-    # Target book links inside <h3> elements
     for h3 in soup.find_all("h3"):
         a_tag = h3.find("a")
         if a_tag and "href" in a_tag.attrs:
-            relative_url = a_tag["href"]
-            # Convert relative URL to absolute URL
-            absolute_url = urljoin(current_page_url, relative_url)
+            absolute_url = urljoin(current_page_url, a_tag["href"])
             book_urls.append(absolute_url)
             
     return book_urls
@@ -69,22 +64,60 @@ def discover_catalogue_books(max_pages: int = 3) -> tuple[int, list[str]]:
     while current_url and pages_visited < max_pages:
         pages_visited += 1
         cache_filename = f"catalogue-page-{pages_visited}.html"
-        
-        # Fetch or load from cache
         html = fetch_page(current_url, cache_filename)
-        
-        # Extract book links from current page[cite: 1]
         page_book_urls = extract_book_urls(html, current_url)
         discovered_urls.extend(page_book_urls)
-        
-        # Find next page link[cite: 1]
         current_url = get_next_page_url(html, current_url)
 
-    # Remove duplicates while preserving order[cite: 1]
     unique_urls = list(dict.fromkeys(discovered_urls))
-    
     return pages_visited, unique_urls
 
-if __name__ == "__main__":
+def parse_book_detail(html: str, product_url: str, source_page: str) -> dict:
+    """Extract all 8 required raw fields from a book detail HTML page."""
+    soup = BeautifulSoup(html, "html.parser")
+    product_main = soup.find("div", class_="product_main")
+
+    title = product_main.find("h1").text.strip()
+    price_text = product_main.find("p", class_="price_color").text.strip()
+    availability_text = product_main.find("p", class_="instock availability").text.strip()
+
+    rating_tag = product_main.find("p", class_="star-rating")
+    rating_text = rating_tag["class"][1] if rating_tag and len(rating_tag["class"]) > 1 else None
+
+    desc_tag = soup.find("div", id="product_description")
+    description = desc_tag.find_next_sibling("p").text.strip() if desc_tag else None
+
+    return {
+        "title": title,
+        "product_url": product_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat()
+    }
+
+def extract_all_raw_records() -> list[dict]:
+    """Iterate across all 60 book URLs, fetch and parse detail records."""
     pages_count, book_urls = discover_catalogue_books(max_pages=3)
-    print(f"\ncatalogue_pages={pages_count}, discovered={len(book_urls)}, unique_urls={len(book_urls)}")
+    raw_records = []
+
+    for index, url in enumerate(book_urls, start=1):
+        slug = url.split("/")[-2]
+        cache_filename = f"detail-{slug}.html"
+
+        cat_page_num = ((index - 1) // 20) + 1
+        source_page = f"https://books.toscrape.com/catalogue/page-{cat_page_num}.html"
+
+        html = fetch_page(url, cache_filename)
+        record = parse_book_detail(html, url, source_page)
+        raw_records.append(record)
+
+    return raw_records
+
+if __name__ == "__main__":
+    records = extract_all_raw_records()
+    print(f"detail_pages={len(records)}\n")
+    print("Sample Raw Record:")
+    print(json.dumps(records[0], indent=2))
