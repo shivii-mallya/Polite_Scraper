@@ -1,15 +1,39 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl, Field
 
 HEADERS = {
     "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/shivii-mallya/Polite_Scraper)"
 }
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
+
+# Mapping star rating words to integers
+RATING_MAP = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5
+}
+
+# Pydantic Schema for Standardized Book Record
+class BookModel(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_gbp: float = Field(..., ge=0.0)
+    in_stock: bool
+    stock_count: int = Field(..., ge=0)
+    rating: int = Field(..., ge=1, le=5)
+    description: str | None = None
+    source_page: HttpUrl
+    fetched_at: str
 
 def fetch_page(url: str, cache_filename: str) -> str:
     """Fetch HTML from cache if available; otherwise fetch live and save to cache."""
@@ -73,7 +97,7 @@ def discover_catalogue_books(max_pages: int = 3) -> tuple[int, list[str]]:
     return pages_visited, unique_urls
 
 def parse_book_detail(html: str, product_url: str, source_page: str) -> dict:
-    """Extract all 8 required raw fields from a book detail HTML page."""
+    """Extract raw fields from book detail HTML page."""
     soup = BeautifulSoup(html, "html.parser")
     product_main = soup.find("div", class_="product_main")
 
@@ -98,10 +122,39 @@ def parse_book_detail(html: str, product_url: str, source_page: str) -> dict:
         "fetched_at": datetime.now(timezone.utc).isoformat()
     }
 
-def extract_all_raw_records() -> list[dict]:
-    """Iterate across all 60 book URLs, fetch and parse detail records."""
-    pages_count, book_urls = discover_catalogue_books(max_pages=3)
-    raw_records = []
+def clean_and_validate_record(raw_record: dict) -> BookModel:
+    """Transform raw extracted text into clean, typed Pydantic models."""
+    # 1. Clean Price
+    price_match = re.search(r"[\d.]+", raw_record["price_text"])
+    price_gbp = float(price_match.group(0)) if price_match else 0.0
+
+    # 2. Clean Availability & Stock Count
+    avail_text = raw_record["availability_text"]
+    in_stock = "In stock" in avail_text
+    stock_match = re.search(r"\d+", avail_text)
+    stock_count = int(stock_match.group(0)) if stock_match else 0
+
+    # 3. Clean Rating
+    rating_word = (raw_record.get("rating_text") or "").lower()
+    rating = RATING_MAP.get(rating_word, 1)
+
+    # 4. Instantiate and validate with Pydantic
+    return BookModel(
+        title=raw_record["title"],
+        product_url=raw_record["product_url"],
+        price_gbp=price_gbp,
+        in_stock=in_stock,
+        stock_count=stock_count,
+        rating=rating,
+        description=raw_record["description"],
+        source_page=raw_record["source_page"],
+        fetched_at=raw_record["fetched_at"]
+    )
+
+def run_pipeline() -> list[BookModel]:
+    """Execute stages 1-4: crawl catalogue, fetch details, clean & export JSON."""
+    _, book_urls = discover_catalogue_books(max_pages=3)
+    validated_books = []
 
     for index, url in enumerate(book_urls, start=1):
         slug = url.split("/")[-2]
@@ -111,13 +164,25 @@ def extract_all_raw_records() -> list[dict]:
         source_page = f"https://books.toscrape.com/catalogue/page-{cat_page_num}.html"
 
         html = fetch_page(url, cache_filename)
-        record = parse_book_detail(html, url, source_page)
-        raw_records.append(record)
+        raw_record = parse_book_detail(html, url, source_page)
+        clean_record = clean_and_validate_record(raw_record)
+        validated_books.append(clean_record)
 
-    return raw_records
+    # Save to output/books.json
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, "books.json")
+    
+    # Dump Pydantic models as JSON
+    json_data = [book.model_dump(mode="json") for book in validated_books]
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(json_data, f, indent=2)
+
+    return validated_books
 
 if __name__ == "__main__":
-    records = extract_all_raw_records()
-    print(f"detail_pages={len(records)}\n")
-    print("Sample Raw Record:")
-    print(json.dumps(records[0], indent=2))
+    books = run_pipeline()
+    print(f"validated_records={len(books)}")
+    print(f"saved_to=output/books.json\n")
+    print("First Validated Record:")
+    print(books[0].model_dump_json(indent=2))
+    
