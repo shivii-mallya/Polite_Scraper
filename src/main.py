@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 import requests
@@ -14,16 +15,8 @@ HEADERS = {
 CACHE_DIR = "cache"
 OUTPUT_DIR = "output"
 
-# Mapping star rating words to integers
-RATING_MAP = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5
-}
+RATING_MAP = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
 
-# Pydantic Schema for Standardized Book Record
 class BookModel(BaseModel):
     title: str
     product_url: HttpUrl
@@ -35,8 +28,8 @@ class BookModel(BaseModel):
     source_page: HttpUrl
     fetched_at: str
 
-def fetch_page(url: str, cache_filename: str) -> str:
-    """Fetch HTML from cache if available; otherwise fetch live and save to cache."""
+def fetch_page(url: str, cache_filename: str) -> str | None:
+    """Fetch HTML with caching, user-agent, timeout, and polite single-retry on 5xx."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
@@ -45,42 +38,43 @@ def fetch_page(url: str, cache_filename: str) -> str:
             return f.read()
 
     time.sleep(0.5)
-    response = requests.get(url, headers=HEADERS, timeout=5)
     
-    if response.status_code != 200:
-        raise RuntimeError(f"Fetch failed with status code: {response.status_code}")
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=5)
+        
+        # Polite retry once on 5xx server errors
+        if response.status_code >= 500:
+            time.sleep(1.0)
+            response = requests.get(url, headers=HEADERS, timeout=5)
 
-    content = response.text
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        if response.status_code != 200:
+            return None
 
-    return content
+        content = response.text
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return content
+
+    except requests.RequestException:
+        return None
 
 def extract_book_urls(html: str, current_page_url: str) -> list[str]:
-    """Extract all book links from a single catalogue page."""
     soup = BeautifulSoup(html, "html.parser")
     book_urls = []
-    
     for h3 in soup.find_all("h3"):
         a_tag = h3.find("a")
         if a_tag and "href" in a_tag.attrs:
-            absolute_url = urljoin(current_page_url, a_tag["href"])
-            book_urls.append(absolute_url)
-            
+            book_urls.append(urljoin(current_page_url, a_tag["href"]))
     return book_urls
 
 def get_next_page_url(html: str, current_page_url: str) -> str | None:
-    """Find the 'next' catalogue page link if it exists."""
     soup = BeautifulSoup(html, "html.parser")
     next_li = soup.find("li", class_="next")
-    if next_li:
-        a_tag = next_li.find("a")
-        if a_tag and "href" in a_tag.attrs:
-            return urljoin(current_page_url, a_tag["href"])
+    if next_li and next_li.find("a"):
+        return urljoin(current_page_url, next_li.find("a")["href"])
     return None
 
 def discover_catalogue_books(max_pages: int = 3) -> tuple[int, list[str]]:
-    """Crawl up to max_pages catalogue pages and gather unique book URLs."""
     current_url = "https://books.toscrape.com/catalogue/page-1.html"
     discovered_urls = []
     pages_visited = 0
@@ -89,15 +83,15 @@ def discover_catalogue_books(max_pages: int = 3) -> tuple[int, list[str]]:
         pages_visited += 1
         cache_filename = f"catalogue-page-{pages_visited}.html"
         html = fetch_page(current_url, cache_filename)
-        page_book_urls = extract_book_urls(html, current_url)
-        discovered_urls.extend(page_book_urls)
-        current_url = get_next_page_url(html, current_url)
+        if html:
+            discovered_urls.extend(extract_book_urls(html, current_url))
+            current_url = get_next_page_url(html, current_url)
+        else:
+            break
 
-    unique_urls = list(dict.fromkeys(discovered_urls))
-    return pages_visited, unique_urls
+    return pages_visited, list(dict.fromkeys(discovered_urls))
 
 def parse_book_detail(html: str, product_url: str, source_page: str) -> dict:
-    """Extract raw fields from book detail HTML page."""
     soup = BeautifulSoup(html, "html.parser")
     product_main = soup.find("div", class_="product_main")
 
@@ -123,22 +117,17 @@ def parse_book_detail(html: str, product_url: str, source_page: str) -> dict:
     }
 
 def clean_and_validate_record(raw_record: dict) -> BookModel:
-    """Transform raw extracted text into clean, typed Pydantic models."""
-    # 1. Clean Price
     price_match = re.search(r"[\d.]+", raw_record["price_text"])
     price_gbp = float(price_match.group(0)) if price_match else 0.0
 
-    # 2. Clean Availability & Stock Count
     avail_text = raw_record["availability_text"]
     in_stock = "In stock" in avail_text
     stock_match = re.search(r"\d+", avail_text)
     stock_count = int(stock_match.group(0)) if stock_match else 0
 
-    # 3. Clean Rating
     rating_word = (raw_record.get("rating_text") or "").lower()
     rating = RATING_MAP.get(rating_word, 1)
 
-    # 4. Instantiate and validate with Pydantic
     return BookModel(
         title=raw_record["title"],
         product_url=raw_record["product_url"],
@@ -151,38 +140,69 @@ def clean_and_validate_record(raw_record: dict) -> BookModel:
         fetched_at=raw_record["fetched_at"]
     )
 
-def run_pipeline() -> list[BookModel]:
-    """Execute stages 1-4: crawl catalogue, fetch details, clean & export JSON."""
-    _, book_urls = discover_catalogue_books(max_pages=3)
+def run_pipeline() -> tuple[list[BookModel], list[dict], dict]:
+    start_time = time.time()
+    pages_count, book_urls = discover_catalogue_books(max_pages=3)
     validated_books = []
+    errors = []
 
     for index, url in enumerate(book_urls, start=1):
         slug = url.split("/")[-2]
         cache_filename = f"detail-{slug}.html"
-
         cat_page_num = ((index - 1) // 20) + 1
         source_page = f"https://books.toscrape.com/catalogue/page-{cat_page_num}.html"
 
         html = fetch_page(url, cache_filename)
-        raw_record = parse_book_detail(html, url, source_page)
-        clean_record = clean_and_validate_record(raw_record)
-        validated_books.append(clean_record)
+        if not html:
+            errors.append({"url": url, "reason": "Failed to fetch page or non-200 HTTP response"})
+            continue
 
-    # Save to output/books.json
+        try:
+            raw_record = parse_book_detail(html, url, source_page)
+            validated_record = clean_and_validate_record(raw_record)
+            validated_books.append(validated_record)
+        except Exception as e:
+            errors.append({"url": url, "reason": f"Validation/Parsing error: {str(e)}"})
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, "books.json")
     
-    # Dump Pydantic models as JSON
+    # Save output/books.json
+    books_path = os.path.join(OUTPUT_DIR, "books.json")
     json_data = [book.model_dump(mode="json") for book in validated_books]
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(books_path, "w", encoding="utf-8") as f:
         json.dump(json_data, f, indent=2)
 
-    return validated_books
+    # Save output/errors.json
+    errors_path = os.path.join(OUTPUT_DIR, "errors.json")
+    with open(errors_path, "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2)
+
+    # Compute & Save output/run-report.json
+    duration = round(time.time() - start_time, 2)
+    avg_price = round(sum(b.price_gbp for b in validated_books) / len(validated_books), 2) if validated_books else 0.0
+    in_stock_ratio = round((sum(1 for b in validated_books if b.in_stock) / len(validated_books)) * 100, 2) if validated_books else 0.0
+    rating_dist = dict(Counter(b.rating for b in validated_books))
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "execution_time_seconds": duration,
+        "catalogue_pages_visited": pages_count,
+        "total_records_extracted": len(validated_books),
+        "failed_records_count": len(errors),
+        "metrics": {
+            "avg_price_gbp": avg_price,
+            "in_stock_ratio_pct": in_stock_ratio,
+            "rating_distribution": rating_dist
+        }
+    }
+    
+    report_path = os.path.join(OUTPUT_DIR, "run-report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    return validated_books, errors, report
 
 if __name__ == "__main__":
-    books = run_pipeline()
-    print(f"validated_records={len(books)}")
-    print(f"saved_to=output/books.json\n")
-    print("First Validated Record:")
-    print(books[0].model_dump_json(indent=2))
-    
+    books, errors, report = run_pipeline()
+    print("Pipeline executed successfully!")
+    print(json.dumps(report, indent=2))
